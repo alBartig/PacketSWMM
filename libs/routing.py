@@ -6,7 +6,7 @@ from swmm_api import read_inp_file, read_out_file
 from swmm_api.input_file.macros import inp_to_graph
 from swmm_api.output_file import VARIABLES as swmm_vars
 from swmm_api.output_file import OBJECTS as swmm_objs
-from helpers import approximate_value
+from libs.helpers import approximate_value
 
 
 class Router:
@@ -18,7 +18,7 @@ class Router:
     def get_flows_from_outfile(self, path_out, start=None, end=None):
         with read_out_file(path_out) as out:
             # import outfile as dataframe
-            flows = out.get_part(kind=swmm_objs.LINK, variable=[swmm_vars.LINK.FLOW, swmm_vars.LINK.VELOCITY])
+            flows = out.get_part(kind=swmm_objs.LINK, variable=swmm_vars.LINK.VELOCITY)
         self.df_flows = flows[start:end]
         return
 
@@ -52,7 +52,7 @@ class Router:
         """
         graph = self.g_network
         if target is not None:
-            graph = graph.subgraph(list(nx.ancestors(graph, target)))
+            graph = graph.subgraph(list(nx.ancestors(graph, target)) + [target])
         columns = list(nx.topological_sort(graph))
         df_routing = pd.DataFrame(columns=columns)
         return df_routing
@@ -92,7 +92,7 @@ class Router:
         hour_weights = [self.seed_pattern[hour.hour] for hour in hours]
         # create list of seeds from the nodes
         seeds = random.choices(self.seed_population["node"], weights=self.seed_population["pop"],
-                               k=sum(self.seed_population["pop"].sum() * sum(hour_weights)))
+                               k=np.around(self.seed_population["pop"].sum() * sum(hour_weights)).astype(int))
         # choose an origin hour for each seed
         seed_hours = [random.choices(hours, hour_weights)[0] for seed in seeds]
         # choose a random time within the hour for each seed
@@ -102,19 +102,35 @@ class Router:
 
     @staticmethod
     def route_packet(start_time, length, edge_velocities):
-        velocity = approximate_value(edge_velocities, start_time)
-        end_time = start_time + pd.to_timedelta(length / velocity, unit="s")
+        try:
+            velocity = edge_velocities[start_time]
+            if velocity == 0.0:
+                # find first non-zero value in series
+                start_time = edge_velocities[start_time:].ne(0).idxmax()
+                velocity = edge_velocities[start_time]
+
+            end_time = start_time + pd.to_timedelta(length / velocity, unit="s")
+        except:
+            return np.nan
         return end_time
 
     def route_table(self, routing_table):
         df = routing_table
-        for node in df.columns:
-            succ_node = self.g_network.successors(node)
-            succ_edge, succ_length = self.g_network.edges[node, succ_node]["obj"].get("name", "length")
-
-            edge_velocities = self.df_flows[succ_edge]
+        for node in df.columns[:-1]:
+            succ_node = list(self.g_network.successors(node))[0]
+            succ_edge, succ_length = self.g_network.edges[node, succ_node]["obj"].get(("name", "length"))
+            # prepare flow table (add missing rows and interpolate)
+            # series of packet arrivals at node
+            packet_times = df.loc[df[node].notnull(), node]
+            # create temporary flow series to interpolate missing values
+            interp_times = pd.Series(np.array(np.nan * np.empty([len(packet_times)])), index=packet_times)
+            temp_series = pd.concat([self.df_flows[succ_edge].copy(), interp_times]).sort_index()
+            # delete duplicate entries in flow series
+            temp_series = temp_series.reset_index().drop_duplicates(subset="index", keep="first").set_index("index").squeeze()
+            temp_series.interpolate(method='time', inplace=True)
+            # apply routing to each packet
             df.loc[df[node].notnull(), succ_node] = (df.loc[df[node].notnull(), node].
-                                                     apply("route_packet", args=(succ_length, edge_velocities)))
+                                                     apply(self.route_packet, args=(succ_length, temp_series)))
         return df
 
 

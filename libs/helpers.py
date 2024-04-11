@@ -2,6 +2,15 @@ import numpy as np
 import pandas as pd
 
 
+def find_next_non_zero(series, starting_index):
+    # Create a boolean mask for non-zero values
+    non_zero_mask = series != 0
+    # Look for the next true value in the mask after the current index
+    future_non_zeros = non_zero_mask[index + 1:]
+    next_index = future_non_zeros.idxmax() if future_non_zeros.any() else np.nan
+    return s[next_index] if next_index != np.nan else np.nan
+
+
 def approximate_value(series, search_time):
     """
     Approximate the value at a specific search_time in a time series.
@@ -21,7 +30,7 @@ def approximate_value(series, search_time):
         return series.loc[search_time]
 
     # Create a temporary Series by appending search_time with NaN, interpolate, and extract the value
-    temp_series = series.append(pd.Series([np.nan], index=[search_time])).sort_index()
+    temp_series = pd.concat([series, pd.Series([np.nan], index=[search_time])]).sort_index()
     temp_series.interpolate(method='time', inplace=True)
 
     return temp_series.loc[search_time]
