@@ -6,8 +6,10 @@ from swmm_api import read_inp_file, read_out_file
 from swmm_api.input_file.macros import inp_to_graph
 from swmm_api.output_file import VARIABLES as swmm_vars
 from swmm_api.output_file import OBJECTS as swmm_objs
+import logging
 from libs.helpers import approximate_value
 
+logger = logging.getLogger("routing")
 
 class Router:
     def __init__(self, g_network=None, df_flows=None):
@@ -20,11 +22,13 @@ class Router:
             # import outfile as dataframe
             flows = out.get_part(kind=swmm_objs.LINK, variable=swmm_vars.LINK.VELOCITY)
         self.df_flows = flows[start:end]
+        logger.info(f"Flows read from {path_out}")
         return
 
     def get_network_from_inpfile(self, path_inp):
         inp = read_inp_file(path_inp)
         self.g_network = inp_to_graph(inp)
+        logger.info(f"Network read from {path_inp}")
         return
 
     def set_seed_pattern(self, hourly_probability):
@@ -38,11 +42,12 @@ class Router:
 
         """
         self.seed_pattern = hourly_probability
+        logger.info(f"Seed pattern set to {hourly_probability}")
         return
 
-    def generate_routingtable(self, target=None):
+    def generate_empty_routingtable(self, target=None):
         """
-        creates a table from the topologically ordered nodes of the input graph
+        creates an empty table from the topologically ordered nodes of the input graph
         Args:
             graph (NetworkX.DiGraph): input graph, hydraulic network
             target (str): outlet / target node of the hydraulic network
@@ -55,6 +60,7 @@ class Router:
             graph = graph.subgraph(list(nx.ancestors(graph, target)) + [target])
         columns = list(nx.topological_sort(graph))
         df_routing = pd.DataFrame(columns=columns)
+        logger.info(f"Routing table from {target} with {len(columns)} columns created")
         return df_routing
 
     @staticmethod
@@ -124,13 +130,13 @@ class Router:
             packet_times = df.loc[df[node].notnull(), node]
             # create temporary flow series to interpolate missing values
             interp_times = pd.Series(np.array(np.nan * np.empty([len(packet_times)])), index=packet_times)
-            temp_series = pd.concat([self.df_flows[succ_edge].copy(), interp_times]).sort_index()
+            temp_flows = pd.concat([self.df_flows[succ_edge].copy(), interp_times]).sort_index()
             # delete duplicate entries in flow series
-            temp_series = temp_series.reset_index().drop_duplicates(subset="index", keep="first").set_index("index").squeeze()
-            temp_series.interpolate(method='time', inplace=True)
+            temp_flows = temp_flows.reset_index().drop_duplicates(subset="index", keep="first").set_index("index").squeeze()
+            temp_flows.interpolate(method='time', inplace=True)
             # apply routing to each packet
             df.loc[df[node].notnull(), succ_node] = (df.loc[df[node].notnull(), node].
-                                                     apply(self.route_packet, args=(succ_length, temp_series)))
+                                                     apply(self.route_packet, args=(succ_length, temp_flows)))
         return df
 
 
