@@ -7,7 +7,6 @@ from swmm_api.input_file.macros import inp_to_graph
 from swmm_api.output_file import VARIABLES as swmm_vars
 from swmm_api.output_file import OBJECTS as swmm_objs
 import logging
-from libs.helpers import approximate_value
 
 logger = logging.getLogger("routing")
 
@@ -107,14 +106,20 @@ class Router:
         return packages
 
     @staticmethod
+    def interpolate_velocity(time, edge_velocities):
+        return np.interp(time.to_numpy(), edge_velocities.index, edge_velocities.values, left=np.nan, right=np.nan)
+
+    @staticmethod
     def route_packet(start_time, length, edge_velocities):
         try:
-            velocity = edge_velocities[start_time]
+            velocity = Router.interpolate_velocity(start_time, edge_velocities)
             if velocity == 0.0:
-                # find first non-zero value in series
+                # find first non-zero value in series, delay transport to next non-zero time
                 start_time = edge_velocities[start_time:].ne(0).idxmax()
                 velocity = edge_velocities[start_time]
-
+            elif velocity is np.nan:
+                # return nan if requested start time is not within edge velocities index
+                return np.nan
             end_time = start_time + pd.to_timedelta(length / velocity, unit="s")
         except:
             return np.nan
@@ -125,18 +130,9 @@ class Router:
         for node in df.columns[:-1]:
             succ_node = list(self.g_network.successors(node))[0]
             succ_edge, succ_length = self.g_network.edges[node, succ_node]["obj"].get(("name", "length"))
-            # prepare flow table (add missing rows and interpolate)
-            # series of packet arrivals at node
-            packet_times = df.loc[df[node].notnull(), node]
-            # create temporary flow series to interpolate missing values
-            interp_times = pd.Series(np.array(np.nan * np.empty([len(packet_times)])), index=packet_times)
-            temp_flows = pd.concat([self.df_flows[succ_edge].copy(), interp_times]).sort_index()
-            # delete duplicate entries in flow series
-            temp_flows = temp_flows.reset_index().drop_duplicates(subset="index", keep="first").set_index("index").squeeze()
-            temp_flows.interpolate(method='time', inplace=True)
             # apply routing to each packet
             df.loc[df[node].notnull(), succ_node] = (df.loc[df[node].notnull(), node].
-                                                     apply(self.route_packet, args=(succ_length, temp_flows)))
+                                                     apply(self.route_packet, args=(succ_length, self.df_flows[succ_edge])))
         return df
 
 
