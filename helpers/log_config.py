@@ -1,6 +1,7 @@
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 
 
 def setup_logging():
@@ -27,7 +28,7 @@ def setup_logging():
     # logger.addHandler(file_handler)
     # logger.addHandler(console_handler)
 
-    logging.basicConfig(filename=r"C:\Users\albert\PycharmProjects\PacketSWMM\helpers\application.log",
+    logging.basicConfig(filename=Path(os.path.abspath(__file__)).parent / "application.log",
                         filemode='w',  # Overwrites the file
                         level=logging.NOTSET,
                         format='%(asctime)s;%(name)s;%(levelname)s;%(message)s')
