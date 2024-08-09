@@ -4,6 +4,8 @@
     <content url="file://$MODULE_DIR$" />
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="module" module-name="ak_local" />
+    <orderEntry type="module" module-name="swmmRouting" />
   </component>
   <component name="PyDocumentationSettings">
     <option name="format" value="GOOGLE" />
