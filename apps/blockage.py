@@ -49,7 +49,7 @@ def fitted_dissipation_rate(X):
     params = [ 0.10194453,  1.23100065, -0.04354149, 10.65112679, -0.38916378]
     return dissipation_rate(X, *params)
 
-def next_blockage(onion, flow, accumulation, current_time, timestep=1):
+def next_blockage(onion, flow, accumulation, current_time, timestep=1, bulk_approach=False):
     """
 
     Args:
@@ -58,6 +58,7 @@ def next_blockage(onion, flow, accumulation, current_time, timestep=1):
         accumulation (float): Number of new arriving wipes in next timestep,
         current_time (timestamp): current time at simulation step
         timestep (float): Timestep length in hours
+        bulk_approach (bool): If True will use bulk approach instead of onion approach
 
     Returns:
         sizes, flushtimes
@@ -65,8 +66,12 @@ def next_blockage(onion, flow, accumulation, current_time, timestep=1):
     sizes = onion["size"]
     flushtimes = onion["flushtime"]
     ages = (current_time - flushtimes) / np.timedelta64(1, "h")
+    avg_ages = np.mean(ages) * np.ones_like(ages)
     # calculate new layer sizes after timestep
-    sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, ages])*timestep)
+    if bulk_approach:
+        sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, avg_ages])*timestep)
+    else:
+        sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, ages])*timestep)
     # add second oldest layer to oldest layer and shift the rest one field
     new_sizes = sizes.copy()
     new_sizes[-1] += new_sizes[-2]
@@ -117,7 +122,7 @@ def accumulate(flowrate):
     probability = accum_probability(q)
     return random.random() < probability
 
-def calc_blockage_series(df, max_age=48):
+def calc_blockage_series(df, max_age=48, bulk=False):
     # prepare arrays
     df["orifice"] = 1
     accumulation, flowrates, orifice = df[["accumulation", "flow", "orifice"]].dropna().values.T
@@ -130,7 +135,7 @@ def calc_blockage_series(df, max_age=48):
     # calculate pile for each timestep
     for i in range(1, len(flush_times)-1, 1):
         onion[i]["size"], onion[i]["flushtime"] = next_blockage(onion[i-1], flowrates[i-1],
-                                                                accumulation[i], flush_times[i])
+                                                                accumulation[i], flush_times[i], bulk_approach=bulk)
     blockage = [sum(layer["size"]) for layer in onion]
 
     # calculate orifice setting
@@ -156,6 +161,14 @@ class BlockageSimulation:
         self.target_link = settings.get("target_link")
         return
 
+    def read_flowrates(self):
+        with read_out_file(self.out_path) as out:
+            # import outfile as dataframe
+            df = out.get_part(kind=swmm_objs.LINK, variable=swmm_vars.LINK.FLOW)
+            s_flows = df.loc[self.start:self.end, self.target_link].resample("1h").mean()
+            s_flows.rename("flow", inplace=True)
+        return s_flows
+
     def blank_model_run(self):
         logger.info("creating empty orifice series")
         # create orifice settings file with full capacity
@@ -169,11 +182,7 @@ class BlockageSimulation:
         logger.info(f"running hydraulic model")
         fn_rpt, fn_out = swmm5_run_epa(self.model_path)
         self.out_path = fn_out
-        with read_out_file(fn_out) as out:
-            # import outfile as dataframe
-            df = out.get_part(kind=swmm_objs.LINK, variable=swmm_vars.LINK.VELOCITY)
-            s_flows = df.loc[self.start:self.end, self.target_link].resample("1h").mean()
-            s_flows.rename("flow", inplace=True)
+        s_flows = self.read_flowrates()
         with pd.HDFStore(self.result_path) as store:
             store["/iteration_0"] = pd.concat([s_orifice, s_blockage, s_flows], axis=1)
         return
@@ -221,13 +230,13 @@ class BlockageSimulation:
         df["accumulation"] = accumulation
         return df
 
-    def run_iterations(self, df, n_iterations, router):
+    def run_iterations(self, df, n_iterations, router, bulk):
         # iteratively calculate orifice settings and blockage series
         for i in range(1, n_iterations+1):
             # calculate blockage series from accumulating wipes and flows
             logger.info(f"starting iteration {i}")
             logger.info(f"calculating orifice settings")
-            df = calc_blockage_series(df[["arrivals", "flow", "accumulation"]].copy())
+            df = calc_blockage_series(df[["arrivals", "flow", "accumulation"]].copy(), bulk=bulk)
             # write orifice settings to .dat file
             write_swmm_timeseries_data(df["orifice"],
                                        r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\orifice_settings.dat")
@@ -236,28 +245,28 @@ class BlockageSimulation:
             fn_rpt, fn_out = swmm5_run_epa(self.model_path)
             self.out_path = fn_out
             # read new hydraulic results
-            router.get_flows_from_outfile(path_out=self.out_path, start=self.start, end=self.end)
-            df["flow"] = router.df_flows[self.target_link].resample("1h").mean()
+            df["flow"] = self.read_flowrates()
+            # write results
             logger.info(f"writing results")
             with pd.HDFStore(self.result_path) as store:
                 store[f"iteration_{i}"] = df[["orifice", "flow", "blockage"]]
             logger.info(f"iteration {i} complete")
         return df
 
-    def run_simulation(self):
+    def run_simulation(self, bulk):
         # run blank
         self.blank_model_run()
         # route initial wipes through network
         arrivals = self.initial_routing()
         # get flow rates from target link
-        s_flowrates = self.router.df_flows[self.target_link].resample("1h").mean().rename("flow")
+        s_flowrates = self.read_flowrates()
         # concatenate flowrates and arrivals to common dataframe
         df = pd.concat([arrivals, s_flowrates], axis=1)
         df["arrivals"].fillna(0, inplace=True)
         # sample snagging and accumulating wipes from arriving
         df = self.sample_accumulation(df)
         # iteratively adapt orifice settings to hydraulic simulation
-        df = self.run_iterations(df, n_iterations=3, router=self.router)
+        df = self.run_iterations(df, n_iterations=3, router=self.router, bulk=bulk)
         return
 
 
@@ -275,7 +284,8 @@ def run_sample_sim():
                     target_link = "MH3295504178.1")
 
     blockage_sim = BlockageSimulation(settings)
-    blockage_sim.run_simulation()
+    bulk=False
+    blockage_sim.run_simulation(bulk=bulk)
 
 
 def run_original():
@@ -355,10 +365,10 @@ def run_original():
         accumulation[i] = accumulations
 
     df["accumulation"] = accumulation
-
+    bulk=False
     # iteratively calculate orifice settings and blockage series
     for i in range(3):
-        df = calc_blockage_series(df)
+        df = calc_blockage_series(df, bulk=bulk)
         write_swmm_timeseries_data(df["orifice"],
                                    r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\orifice_settings.dat")
         fn_rpt, fn_out = swmm5_run_epa(model_path)
