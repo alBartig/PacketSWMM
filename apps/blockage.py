@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -7,7 +9,7 @@ from swmmRouting.seeding import Seeder
 from swmm_api.input_file import read_inp_file
 from swmm_api.output_file import read_out_file
 from swmm_api.external_files.dat_timeseries import write_swmm_timeseries_data, read_swmm_timeseries_data
-from swmm_api.run_swmm.run_epaswmm import swmm5_run_epa
+from swmm_api.run_swmm.run_epaswmm import swmm5_run_epa, run_swmm_custom, get_swmm_command_line_auto
 from swmm_api.output_file import VARIABLES as swmm_vars
 from swmm_api.output_file import OBJECTS as swmm_objs
 import warnings
@@ -32,10 +34,9 @@ console_handler.setFormatter(formatter)
 # Add the handler to the logger
 logger.addHandler(console_handler)
 
-
-def dissipation_rate(X, b1, b2, b3, b4, b5):
+def dissipation_rate(X, b1, b2, b3, b4):
     wipes, flow_rate, time = X
-    return (b1 * wipes + b2 * flow_rate + b3 * wipes * flow_rate + b4) * np.exp(b5 * time)
+    return (b1 * wipes + b2) * np.exp(b3 * time) * flow_rate**b4
 
 def fitted_dissipation_rate(X):
     """
@@ -46,7 +47,7 @@ def fitted_dissipation_rate(X):
     Returns:
         dissipation rate (float)
     """
-    params = [ 0.10194453,  1.23100065, -0.04354149, 10.65112679, -0.38916378]
+    params = [-0.31000456, 16.45328033, -0.38209651,  0.22813606]
     return dissipation_rate(X, *params)
 
 def next_blockage(onion, flow, accumulation, current_time, timestep=1, bulk_approach=False):
@@ -69,7 +70,11 @@ def next_blockage(onion, flow, accumulation, current_time, timestep=1, bulk_appr
     avg_ages = np.mean(ages) * np.ones_like(ages)
     # calculate new layer sizes after timestep
     if bulk_approach:
-        sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, avg_ages])*timestep)
+        try:
+            sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, avg_ages])*timestep)
+        except:
+            print("error")
+            pass
     else:
         sizes = sizes * np.exp(-fitted_dissipation_rate([sizes, flow, ages])*timestep)
     # add second oldest layer to oldest layer and shift the rest one field
@@ -139,7 +144,8 @@ def calc_blockage_series(df, max_age=48, bulk=False):
     blockage = [sum(layer["size"]) for layer in onion]
 
     # calculate orifice setting
-    blockage_scaled, flowrates_scaled = scaler.transform(np.c_[blockage, flowrates]).T
+    blockage_scaled, flowrates_scaled = scaler.transform(np.c_[np.minimum(blockage, 999), np.minimum(flowrates, 999)]).T
+
     orifice = orifice_model_fitted(blockage_scaled, flowrates_scaled)
     df["orifice"] = orifice
     df["blockage"] = blockage
@@ -151,7 +157,10 @@ class BlockageSimulation:
         self.model_path = settings.get("model_path")
         self.out_path = settings.get("out_path")
         self.pop_path = settings.get("pop_path")
-        self.orifice_path = settings.get("orifice_path")
+        if type(settings.get("orifice_path")) == Path:
+            self.orifice_path = settings.get("orifice_path")
+        else:
+            self.orifice_path = Path(settings.get("orifice_path"))
         self.result_path = settings.get("result_path")
         self.defpat = settings.get("defpat")
         inp = read_inp_file(self.model_path)
@@ -159,15 +168,30 @@ class BlockageSimulation:
         self.end = datetime.combine(inp.OPTIONS.get("END_DATE"), inp.OPTIONS.get("END_TIME"))
         self.target_node = settings.get("target_node")
         self.target_link = settings.get("target_link")
+        self.target_orifice = settings.get("target_orifice")
         return
 
-    def read_flowrates(self):
-        with read_out_file(self.out_path) as out:
+    def read_flowrates(self, outpath=None, target="orifice"):
+        if outpath is None:
+            outpath = self.out_path
+        if target == "orifice":
+            target = self.target_orifice
+        elif target == "link":
+            target = self.target_link
+        with read_out_file(outpath) as out:
             # import outfile as dataframe
             df = out.get_part(kind=swmm_objs.LINK, variable=swmm_vars.LINK.FLOW)
-            s_flows = df.loc[self.start:self.end, self.target_link].resample("1h").mean()
+            s_flows = df.loc[self.start:self.end, target].resample("1h").mean()
             s_flows.rename("flow", inplace=True)
         return s_flows
+
+    def read_nodedepths(self):
+        with read_out_file(self.out_path) as out:
+            # import outfile as dataframe
+            df = out.get_part(kind=swmm_objs.NODE, variable=swmm_vars.NODE.DEPTH)
+            s_depth = df.loc[self.start:self.end, self.target_node].resample("1h").mean()
+            s_depth.rename("depth", inplace=True)
+        return s_depth
 
     def blank_model_run(self):
         logger.info("creating empty orifice series")
@@ -183,8 +207,9 @@ class BlockageSimulation:
         fn_rpt, fn_out = swmm5_run_epa(self.model_path)
         self.out_path = fn_out
         s_flows = self.read_flowrates()
-        with pd.HDFStore(self.result_path) as store:
-            store["/iteration_0"] = pd.concat([s_orifice, s_blockage, s_flows], axis=1)
+        s_depth = self.read_nodedepths()
+        with pd.HDFStore(self.result_path, mode="w") as store:
+            store["/iteration_0"] = pd.concat([s_orifice, s_blockage, s_flows, s_depth], axis=1)
         return
 
     def initial_routing(self):
@@ -238,19 +263,36 @@ class BlockageSimulation:
             logger.info(f"calculating orifice settings")
             df = calc_blockage_series(df[["arrivals", "flow", "accumulation"]].copy(), bulk=bulk)
             # write orifice settings to .dat file
-            write_swmm_timeseries_data(df["orifice"],
-                                       r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\orifice_settings.dat")
+            write_swmm_timeseries_data(df["orifice"].round(3), self.orifice_path, drop_zeros=False)
+            write_swmm_timeseries_data(df["orifice"].round(3), self.orifice_path.parent / f"or_setting_iteration{i}.dat",
+                                       drop_zeros=False)
             # run swmm model for updated hydraulic results
             logger.info(f"running hydraulic model")
-            fn_rpt, fn_out = swmm5_run_epa(self.model_path)
+            if type(self.model_path) != Path:
+                self.model_path = Path(self.model_path)
+            fn_rpt = self.model_path.parent / f"rptfile_iteration{i}.rpt"
+            fn_out = self.model_path.parent / f"outfile_iteration{i}.out"
+            cmd = get_swmm_command_line_auto(self.model_path,
+                                             fn_rpt,
+                                             fn_out)
+            run_swmm_custom(cmd)
+            logger.info(f"Model run finished:\n"
+                        f"New rpt-file at {fn_rpt}\n"
+                        f"New out-file at {fn_out}")
             self.out_path = fn_out
             # read new hydraulic results
-            df["flow"] = self.read_flowrates()
+            df["flow"] = 0.0
+            df["flow"] = self.read_flowrates(fn_out)
+            df["depth"] = self.read_nodedepths()
             # write results
             logger.info(f"writing results")
             with pd.HDFStore(self.result_path) as store:
-                store[f"iteration_{i}"] = df[["orifice", "flow", "blockage"]]
-            logger.info(f"iteration {i} complete")
+                store[f"iteration_{i}"] = df[["orifice", "flow", "blockage", "depth"]]
+            try:
+                logger.info(f"iteration {i} complete")
+            except:
+                print("error")
+                pass
         return df
 
     def run_simulation(self, bulk):
@@ -260,8 +302,9 @@ class BlockageSimulation:
         arrivals = self.initial_routing()
         # get flow rates from target link
         s_flowrates = self.read_flowrates()
+        s_nodedepths = self.read_nodedepths()
         # concatenate flowrates and arrivals to common dataframe
-        df = pd.concat([arrivals, s_flowrates], axis=1)
+        df = pd.concat([arrivals, s_flowrates, s_nodedepths], axis=1)
         df["arrivals"].fillna(0, inplace=True)
         # sample snagging and accumulating wipes from arriving
         df = self.sample_accumulation(df)
@@ -271,110 +314,22 @@ class BlockageSimulation:
 
 
 def run_sample_sim():
-    df_defpat = pd.Series(0.9 * np.array([1.4, 0.3, 0.1, 0.0, 0.3, 1.7, 9.1, 21, 13, 9, 6.9, 4.9,
-                                           1.9, 3.6, 2.5, 2, 2.9, 2.3, 4.1, 4.0, 2.7, 2.1, 2.2, 2.0]) / 100)
-
-    settings = dict(model_path = r"..\sample_data\sample_model.inp",
-                    pop_path = r"../sample_data/pop_data.csv",
-                    out_path = r"..\sample_data\sample_model.out",
-                    orifice_path = r"../sample_data/orifice_settings.dat",
-                    result_path = r"../sample_data/blockage_results.hd5",
-                    defpat = df_defpat,
-                    target_node = "MH3295504178",
-                    target_link = "MH3295504178.1")
+    df_defpat = pd.Series(0.1 * np.array([1.4, 0.3, 0.1, 0.0, 0.3, 1.7, 9.1, 21, 13, 9, 6.9, 4.9,
+                                          1.9, 3.6, 2.5, 2, 2.9, 2.3, 4.1, 4.0, 2.7, 2.1, 2.2, 2.0]) / 100)
+    result_path = r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\katys_model\blockage_results250.hd5"
+    settings = dict(model_path=r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\katys_model\Sample.inp",
+                    pop_path=r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\katys_model\Pop_data.csv",
+                    out_path=r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\katys_model\Sample.out",
+                    orifice_path=r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\katys_model\orifice_settings.dat",
+                    result_path=result_path,
+                    defpat=df_defpat,
+                    target_node="MH4699705183",
+                    target_link="MH4699705183.1",
+                    target_orifice="O1")
 
     blockage_sim = BlockageSimulation(settings)
     bulk=False
     blockage_sim.run_simulation(bulk=bulk)
-
-
-def run_original():
-    from src.swmmRouting.routing import Router
-    from src.swmmRouting.seeding import Seeder
-    from swmm_api.external_files.dat_timeseries import write_swmm_timeseries_data, read_swmm_timeseries_data
-    from swmm_api.run_swmm.run_epaswmm import swmm5_run_epa
-
-    # settings for packet router
-    model_path = r"..\sample_data\sample_model.inp"
-    pop_path = r"../sample_data/pop_data.csv"
-    orifice_path = r"../sample_data/orifice_settings.dat"
-
-    # cleaning orifice setting data
-    s = read_swmm_timeseries_data(r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\orifice_settings.dat")
-    s.loc[:] = 0
-    write_swmm_timeseries_data(s, orifice_path, drop_zeros=False)
-
-    # run model initial run
-    out_path = r"..\sample_data\sample_model.out"
-    # rpt_path, out_path = swmm5_run_epa(model_path)
-
-    target_node = "MH3295504178"
-    start = pd.to_datetime("01.04.2015 00:00", format="%d.%m.%Y %H:%M")
-    end = pd.to_datetime("01.06.2015 00:00", format="%d.%m.%Y %H:%M")
-
-    # pattern for distribution of defecation events, total sum of 1.5 defecations per day
-    # df_defpat = pd.Series(1.5 * np.array([1.4, 0.3, 0.1, 0.0, 0.3, 1.7, 9.1, 21, 13, 9, 6.9, 4.9,
-    #                                      1.9, 3.6, 2.5, 2, 2.9, 2.3, 4.1, 4.0, 2.7, 2.1, 2.2, 2.0])/100)
-    df_defpat = pd.Series(0.9 * np.array([1.4, 0.3, 0.1, 0.0, 0.3, 1.7, 9.1, 21, 13, 9, 6.9, 4.9,
-                                           1.9, 3.6, 2.5, 2, 2.9, 2.3, 4.1, 4.0, 2.7, 2.1, 2.2, 2.0]) / 100)
-    # number of wipes sent per flush
-
-    # prepare seeder
-    df_population = pd.read_csv(pop_path)
-    seeder = Seeder(df_seeding_population=df_population, hourly_probability=df_defpat)
-    seed_table = seeder.generate_seeds(start=start, end=end)
-
-    # prepare router
-    router = Router()
-    router.get_network_from_inpfile(model_path)
-    router.get_flows_from_outfile(path_out=out_path, start=start, end=end)
-
-    # create seeds and route table
-    rtable = router.from_seeding_table(seeding_table=seed_table, target=target_node)
-    routed = router.route_table(rtable)
-
-    # get arrivals from target node and aggregate to 1 hour timeslots
-    arrivals = routed[target_node].dropna().sort_values()
-    hourly_arrivals = arrivals.dt.floor("H")
-    s_arrivals = hourly_arrivals.groupby(hourly_arrivals).size()
-    s_arrivals = s_arrivals[s_arrivals.index > start]
-    s_arrivals.rename("arrivals", inplace=True)
-
-    # get flow rates from target link
-    s_flowrates = router.df_flows["MH3295504178.1"].resample("1h").mean().rename("flow")
-    # concatenate flowrates and arrivals to common dataframe
-    df = pd.concat([s_arrivals, s_flowrates], axis=1)
-    df["arrivals"].fillna(0, inplace=True)
-
-    # sample snagging and accumulating wipes from arrivals
-    accumulation = np.zeros(len(df))
-    pile = 0
-    wipes_per_flush = 0.1
-    for i, (idx, values) in enumerate(df.iterrows()):
-        n_arrivals = (wipes_per_flush * values["arrivals"]).round(0).astype(int)
-        flowrate = values["flow"]
-        accumulations = 0
-        # if no pile exists, calculate snagging
-        while (pile == 0) & (n_arrivals > 0):
-            snagged = snag(flowrate)
-            pile += snagged
-            accumulations += snagged
-            n_arrivals -= 1
-        # calculate accumulation with remaining arriving wipes
-        accumulations += sum([accumulate(flowrate) for _ in range(n_arrivals)])
-        accumulation[i] = accumulations
-
-    df["accumulation"] = accumulation
-    bulk=False
-    # iteratively calculate orifice settings and blockage series
-    for i in range(3):
-        df = calc_blockage_series(df, bulk=bulk)
-        write_swmm_timeseries_data(df["orifice"],
-                                   r"C:\Users\albert\PycharmProjects\PacketSWMM\sample_data\orifice_settings.dat")
-        fn_rpt, fn_out = swmm5_run_epa(model_path)
-        router.get_flows_from_outfile(path_out=out_path, start=start, end=end)
-        df["flow"] = router.df_flows["MH3295504178.1"].resample("1h").mean()
-    return
 
 
 def main():
